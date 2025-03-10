@@ -2,6 +2,6 @@ streamlit
 pandas
 numpy
 matplotlib
+pandas-ta
 yfinance
 tvdatafeed
-pandas_ta

@@ -4,4 +4,3 @@ numpy
 matplotlib
 yfinance
 tvdatafeed
-TA-Lib

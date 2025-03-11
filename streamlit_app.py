@@ -4,12 +4,12 @@ np.NaN = np.nan  # Monkey patch: ensures uppercase NaN exists for pandas_ta
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-import pandas_ta as ta  # For technical indicators
-import ccxt  # For fetching crypto data from US-based exchanges
-import requests  # For fetching data from Dexscreener
+import pandas_ta as ta
+import ccxt
+import requests
 
 # -------------------------------
-# CORE FUNCTIONS FOR EXCHANGE DATA & TA
+# 1. EXCHANGE DATA & TA FUNCTIONS
 # -------------------------------
 
 def get_data(symbol, exchange_name, timeframe='15m', limit=500):
@@ -164,59 +164,57 @@ def process_timeframe(symbol, exchange_name, timeframe):
     return df, score, signal, explanation
 
 # -------------------------------
-# DEXSCREENER FUNCTIONS
+# 2. DEXSCREENER LOOKUP FUNCTIONS
 # -------------------------------
 
-def get_dexscreener_data_exact(url):
+def dex_exact_lookup(chain, contract):
     """
-    Converts a Dexscreener URL (chain + pool) into the Dexscreener API endpoint
-    and fetches the JSON data for that specific pool.
-    Example:
-      https://dexscreener.com/solana/xPoolId -> https://api.dexscreener.com/latest/dex/trading-pairs/solana/xPoolId
+    Direct call to DexScreener's chain+contract endpoint.
+    Example: https://api.dexscreener.com/latest/dex/trading-pairs/solana/XYZ
     """
-    try:
-        parts = url.split('/')
-        if len(parts) >= 5:
-            chain = parts[3]
-            pool = parts[4]
-            api_url = f"https://api.dexscreener.com/latest/dex/trading-pairs/{chain}/{pool}"
-            response = requests.get(api_url)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                st.write("Error fetching from Dexscreener API:", response.status_code)
-                return None
-        else:
-            st.write("Invalid Dexscreener URL format.")
-            return None
-    except Exception as e:
-        st.write("Exception in fetching Dexscreener data:", e)
-        return None
+    api_url = f"https://api.dexscreener.com/latest/dex/trading-pairs/{chain}/{contract}"
+    response = requests.get(api_url)
+    if response.status_code == 200:
+        return response.json()
+    return None
 
-def search_dexscreener(keyword):
+def dex_search_contract(contract):
     """
-    A broader Dexscreener search approach (undocumented endpoint).
-    Attempts to return as many results as possible for the given keyword.
-    Dexscreener may still limit or filter results.
+    Tries an undocumented DexScreener search endpoint to find any references to the contract.
+    Large queries might be partial or rate-limited.
     """
-    try:
-        # Some Dexscreener endpoints are not officially documented;
-        # 'search' might accept a 'limit' param, but we try to keep it large or omit it.
-        # Example guess: https://api.dexscreener.com/search?q={keyword}&limit=9999
-        # If it doesn't work, Dexscreener might have changed their API or restrict large queries.
-        search_url = f"https://api.dexscreener.com/search?q={keyword}&limit=9999"
-        response = requests.get(search_url)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            st.write("Error searching Dexscreener:", response.status_code)
-            return None
-    except Exception as e:
-        st.write("Exception in searching Dexscreener:", e)
+    search_url = f"https://api.dexscreener.com/search?q={contract}"
+    response = requests.get(search_url)
+    if response.status_code == 200:
+        return response.json()
+    return None
+
+def dex_fetch_any_chain(url):
+    """
+    1. Parse chain & contract from the DexScreener URL: https://dexscreener.com/{chain}/{contract}
+    2. Attempt exact DexScreener API call: /latest/dex/trading-pairs/{chain}/{contract}
+    3. If that fails (404), fallback to 'dex_search_contract(contract)'.
+    """
+    parts = url.strip().split('/')
+    if len(parts) < 5:
+        st.write("Invalid Dexscreener URL format. Expected https://dexscreener.com/{chain}/{contract}")
         return None
+    
+    chain = parts[3]
+    contract = parts[4]
+    
+    # 1) Exact lookup
+    data = dex_exact_lookup(chain, contract)
+    if data:
+        return data
+    
+    # 2) Fallback: broad search by contract
+    st.write("Exact lookup failed. Attempting fallback search by contract...")
+    data = dex_search_contract(contract)
+    return data
 
 # -------------------------------
-# TOP BUY COINS FUNCTION
+# 3. TOP BUY COINS FUNCTION
 # -------------------------------
 
 def get_top_buy_coins_by_quote(exchange_name, quote_currency, timeframe='15m', max_pairs=30):
@@ -247,12 +245,13 @@ def get_top_buy_coins_by_quote(exchange_name, quote_currency, timeframe='15m', m
     return pd.DataFrame(results[:10])
 
 # -------------------------------
-# MAIN APP INTERFACE
+# 4. MAIN APP INTERFACE
 # -------------------------------
 
 def main():
     st.title("Crypto Technical Analysis AI Agent (US-Based, No BNB)")
-    st.write("Analyze any trading pair on your chosen US-based exchange. Get a Prediction Score, trade signal, and short TA reasoning. Also search Dexscreener for broader data.")
+    st.write("Analyze any trading pair on your chosen US-based exchange (Kraken, Coinbase Pro, Gemini).")
+    st.write("Compute a multi-timeframe prediction score and trade signal, plus DexScreener lookups on any chain/contract.")
     
     # --- Single Pair Analysis Section ---
     st.header("Single Pair Analysis")
@@ -297,25 +296,17 @@ def main():
             st.table(top_buy_df)
     
     # --- Dexscreener Data Section ---
-    st.header("Dexscreener Exact Pool Lookup")
-    dex_url = st.text_input("Enter Dexscreener Pool URL (e.g., https://dexscreener.com/solana/xPoolId)")
-    if st.button("Fetch Dexscreener Data (Exact)") and dex_url:
-        dex_data = get_dexscreener_data_exact(dex_url)
-        if dex_data:
-            st.write("Exact Dexscreener Data:")
-            st.json(dex_data)
+    st.header("Dexscreener Contract Lookup")
+    st.write("Paste a Dexscreener URL for any chain/contract (e.g. https://dexscreener.com/solana/ADDRESS).")
+    dex_url = st.text_input("Dexscreener URL", "")
+    if st.button("Fetch Dexscreener Data") and dex_url:
+        st.write("Attempting direct DexScreener chain+contract lookup. If that fails, fallback to searching by contract.")
+        data = dex_fetch_any_chain(dex_url)
+        if data:
+            st.write("Dexscreener Result:")
+            st.json(data)
         else:
-            st.write("Failed to fetch data from Dexscreener (Exact).")
-    
-    st.header("Dexscreener Broad Search")
-    dex_keyword = st.text_input("Enter a keyword to search Dexscreener (no strict limit)", "")
-    if st.button("Search Dexscreener (Broad)") and dex_keyword:
-        results = search_dexscreener(dex_keyword)
-        if results:
-            st.write("Dexscreener Search Results:")
-            st.json(results)
-        else:
-            st.write("No results or error from Dexscreener search.")
+            st.write("No data found for that chain/contract on Dexscreener.")
 
 if __name__ == "__main__":
     main()

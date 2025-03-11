@@ -1,34 +1,28 @@
 import numpy as np
-np.NaN = np.nan  # Monkey patch: create uppercase NaN for pandas_ta
+np.NaN = np.nan  # Monkey patch to ensure uppercase NaN exists for pandas_ta
 
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-import pandas_ta as ta  # Using pandas_ta for technical indicators
+import pandas_ta as ta  # For technical indicators
+import ccxt  # For fetching crypto data from exchanges
 
-# 1) Fetch data (try TradingView via tvDatafeed, fallback to yfinance)
-def get_data(ticker, exchange):
+# Function to fetch crypto data from Binance using ccxt
+def get_data(symbol, timeframe='15m', limit=500):
+    exchange = ccxt.binance({'enableRateLimit': True})
     try:
-        from tvDatafeed import TvDatafeed, Interval
-        tv = TvDatafeed()  # Optionally pass your TradingView credentials if needed
-        df = tv.get_hist(symbol=ticker, exchange=exchange, interval=Interval.in_15_minute, n_bars=500)
-        st.write("Using TradingView data.")
+        # Fetch OHLCV data: [timestamp, open, high, low, close, volume]
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        st.write("Data fetched from Binance using ccxt.")
     except Exception as e:
-        st.write("Failed to fetch from TradingView, using yfinance as fallback.")
-        import yfinance as yf
-        df = yf.download(ticker, interval='15m', period='5d')
-    
-    # Standardize column names
-    df.rename(columns={
-        'Open': 'open',
-        'High': 'high',
-        'Low': 'low',
-        'Close': 'close',
-        'Volume': 'volume'
-    }, inplace=True, errors='ignore')
+        st.write("Error fetching data:", e)
+        df = pd.DataFrame()  # Return an empty DataFrame on error
     return df
 
-# 2) Compute technical indicators using pandas_ta
+# Compute technical indicators using pandas_ta
 def compute_indicators(df):
     df['SMA14'] = ta.sma(df['close'], length=14)
     df['RSI'] = ta.rsi(df['close'], length=14)
@@ -38,7 +32,7 @@ def compute_indicators(df):
     df['BB_upper'] = bb['BBU_20_2.0']
     return df
 
-# 3) Calculate Fibonacci retracement levels based on recent data
+# Calculate Fibonacci retracement levels using the last 100 bars
 def calculate_fibonacci_levels(df, lookback=100):
     recent = df[-lookback:]
     high = recent['high'].max()
@@ -54,7 +48,7 @@ def calculate_fibonacci_levels(df, lookback=100):
     }
     return levels
 
-# 4) Analyze volume and price action
+# Analyze volume and price action to generate a simple signal
 def analyze_volume_price(df):
     df['vol_SMA'] = ta.sma(df['volume'], length=14)
     df['price_change'] = df['close'].pct_change()
@@ -64,44 +58,42 @@ def analyze_volume_price(df):
     )
     return df
 
-# 5) Aggregate signals into a percentage score (0 to 100)
+# Aggregate signals into a score between 0 and 100
 def calculate_percentage_wheel(df, fib_levels):
     latest = df.iloc[-1]
-    score = 50  # Start neutral
-    
+    score = 50  # Neutral starting point
+
     # RSI contribution
     if latest['RSI'] < 30:
         score += 10
     elif latest['RSI'] > 70:
         score -= 10
-    
+
     # SMA contribution
     if latest['close'] > latest['SMA14']:
         score += 10
     else:
         score -= 10
-    
+
     # Bollinger Bands contribution
     if latest['close'] < latest['BB_lower']:
         score += 5
     elif latest['close'] > latest['BB_upper']:
         score -= 5
-    
-    # Fibonacci Retracement contribution (using a 1% tolerance)
+
+    # Fibonacci retracement contribution (using 1% tolerance)
     tolerance = 0.01 * latest['close']
     if abs(latest['close'] - fib_levels['38.2%']) < tolerance or abs(latest['close'] - fib_levels['50%']) < tolerance:
         score += 5
     if abs(latest['close'] - fib_levels['23.6%']) < tolerance:
         score -= 5
-    
+
     # Volume/Price Action contribution
     score += latest['vol_price_signal'] * 5
-    
-    # Ensure score is between 0 and 100
-    score = max(0, min(100, score))
-    return score
 
-# 6) Convert percentage score to a simple trade signal
+    return max(0, min(100, score))
+
+# Convert the percentage score into a simple trade signal
 def predict_signal(score):
     if score > 55:
         return 'Buy'
@@ -110,42 +102,49 @@ def predict_signal(score):
     else:
         return 'Neutral'
 
-# 7) Plot the chart with indicators
-def plot_chart(df, ticker):
+# Plot the chart with technical indicators
+def plot_chart(df, symbol):
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(df['close'], label='Close Price')
     ax.plot(df['SMA14'], label='SMA 14', linestyle='--')
     ax.plot(df['BB_upper'], label='BB Upper', linestyle='--')
     ax.plot(df['BB_lower'], label='BB Lower', linestyle='--')
-    ax.set_title(f"{ticker} - 15 Minute Chart Analysis")
+    ax.set_title(f"{symbol} - 15 Minute Chart Analysis")
     ax.legend()
     st.pyplot(fig)
 
-# 8) Streamlit User Interface
+# Main Streamlit interface
 def main():
-    st.title("AI Agent for Technical Analysis")
-    st.write("Enter a ticker symbol and exchange to see the prediction based on multiple indicators.")
+    st.title("Crypto Technical Analysis AI Agent")
+    st.write("Enter a crypto trading pair (e.g., BTC/USDT) to analyze 15-minute data.")
     
-    ticker = st.text_input("Ticker Symbol (e.g., BTCUSDT, AAPL)", value="BTCUSDT")
-    exchange = st.text_input("Exchange (e.g., BINANCE, NASDAQ)", value="BINANCE")
+    # Input: Trading pair symbol
+    symbol = st.text_input("Trading Pair (e.g., BTC/USDT)", value="BTC/USDT")
     
     if st.button("Analyze"):
-        df = get_data(ticker, exchange)
-        if df is None or df.empty:
-            st.write("No data retrieved. Please check the ticker and exchange.")
+        df = get_data(symbol, timeframe='15m', limit=500)
+        if df.empty:
+            st.write("No data retrieved. Please check your trading pair symbol.")
             return
-        
+
+        # Debug: Show the raw data (first few rows)
+        st.write("Fetched Data (first 5 rows):")
+        st.write(df.head())
+
+        # Process the data with technical indicators
         df = compute_indicators(df)
         fib_levels = calculate_fibonacci_levels(df, lookback=100)
         df = analyze_volume_price(df)
         
+        # Calculate the percentage score and trade signal
         score = calculate_percentage_wheel(df, fib_levels)
         signal = predict_signal(score)
         
         st.write(f"**Prediction Score:** {score}%")
         st.write(f"**Trade Signal:** {signal}")
         
-        plot_chart(df, ticker)
+        # Plot the technical chart
+        plot_chart(df, symbol)
 
 if __name__ == "__main__":
     main()

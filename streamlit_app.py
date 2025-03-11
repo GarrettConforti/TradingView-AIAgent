@@ -104,6 +104,40 @@ def predict_signal(score):
     else:
         return 'Neutral'
 
+# Generate simple reasoning text based on technical indicators
+def generate_reasoning(df, fib_levels):
+    latest = df.iloc[-1]
+    reasoning_parts = []
+    
+    # RSI explanation
+    if latest['RSI'] < 30:
+        reasoning_parts.append("RSI is low (oversold), suggesting a potential upward reversal")
+    elif latest['RSI'] > 70:
+        reasoning_parts.append("RSI is high (overbought), suggesting caution")
+    else:
+        reasoning_parts.append("RSI is neutral")
+    
+    # SMA explanation
+    if latest['close'] > latest['SMA14']:
+        reasoning_parts.append("Price is above the 14-period SMA, indicating bullish momentum")
+    else:
+        reasoning_parts.append("Price is below the 14-period SMA, indicating bearish trends")
+    
+    # Bollinger Bands explanation
+    if latest['close'] < latest['BB_lower']:
+        reasoning_parts.append("Price is near the lower Bollinger Band, implying potential support and a bounce")
+    elif latest['close'] > latest['BB_upper']:
+        reasoning_parts.append("Price is near the upper Bollinger Band, implying potential resistance")
+    
+    # Fibonacci explanation
+    tolerance = 0.01 * latest['close']
+    if abs(latest['close'] - fib_levels['38.2%']) < tolerance or abs(latest['close'] - fib_levels['50%']) < tolerance:
+        reasoning_parts.append("Trading near key Fibonacci support levels boosts bullish confidence")
+    elif abs(latest['close'] - fib_levels['23.6%']) < tolerance:
+        reasoning_parts.append("Trading near a Fibonacci resistance level suggests caution")
+    
+    return ". ".join(reasoning_parts) + "."
+
 # Plot the chart with technical indicators
 def plot_chart(df, symbol, timeframe):
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -115,7 +149,7 @@ def plot_chart(df, symbol, timeframe):
     ax.legend()
     st.pyplot(fig)
 
-# Process a given timeframe: fetch data, compute indicators, calculate score and signal
+# Process a given timeframe: fetch data, compute indicators, calculate score, and signal
 def process_timeframe(symbol, exchange_name, timeframe):
     df = get_data(symbol, exchange_name, timeframe, limit=500)
     if df.empty:
@@ -125,34 +159,35 @@ def process_timeframe(symbol, exchange_name, timeframe):
     df = analyze_volume_price(df)
     score = calculate_percentage_wheel(df, fib_levels)
     signal = predict_signal(score)
-    return df, score, signal
+    return df, score, signal, fib_levels
 
-# Get Top 10 Coins with a Buy Rating (15-minute analysis) for US-based exchanges
+# Get Top 10 Coins with a Buy Rating (15-minute analysis) for US-based exchanges and include reasoning
 def get_top_buy_coins(exchange_name, timeframe='15m'):
     # Predefined list of popular US-based trading pairs (exclude coins like BNB)
     coin_list = ["BTC/USD", "ETH/USD", "ADA/USD", "SOL/USD", "XRP/USD", 
                  "DOGE/USD", "LTC/USD", "DOT/USD", "BCH/USD", "LINK/USD"]
     results = []
     for coin in coin_list:
-        df, score, signal = process_timeframe(coin, exchange_name, timeframe)
+        df, score, signal, fib_levels = process_timeframe(coin, exchange_name, timeframe)
         if df is not None and not df.empty and signal == "Buy":
-            results.append({"Coin": coin, "Score": score, "Signal": signal})
+            reasoning = generate_reasoning(df, fib_levels)
+            results.append({"Coin": coin, "Score": score, "Signal": signal, "Reasoning": reasoning})
+    # Sort by highest score
     results = sorted(results, key=lambda x: x["Score"], reverse=True)
     return pd.DataFrame(results[:10])
 
 # Main Streamlit app interface
 def main():
     st.title("US-Based Crypto Technical Analysis AI Agent")
-    st.write("Enter a crypto trading pair and select a US-based exchange to analyze prediction scores for different timeframes.")
+    st.write("Enter a crypto trading pair and select a US-based exchange to analyze prediction scores for 15-minute and 30-minute timeframes.")
     st.write("For example, for Kraken, Coinbase Pro, or Gemini use trading pairs like **BTC/USD**.")
     
     symbol = st.text_input("Trading Pair (e.g., BTC/USD)", value="BTC/USD")
-    # Only allow US-based exchanges:
     exchange_name = st.selectbox("Select US-Based Exchange", options=["kraken", "coinbasepro", "gemini"])
     
     if st.button("Analyze"):
         st.subheader("15-Minute Analysis")
-        df15, score15, signal15 = process_timeframe(symbol, exchange_name, '15m')
+        df15, score15, signal15, fib_levels15 = process_timeframe(symbol, exchange_name, '15m')
         if df15 is None or df15.empty:
             st.write("No data retrieved for 15-minute timeframe. Please check your trading pair symbol and exchange selection.")
         else:
@@ -160,10 +195,11 @@ def main():
             st.write(df15.head())
             st.write(f"**15-Minute Prediction Score:** {score15}%")
             st.write(f"**15-Minute Trade Signal:** {signal15}")
+            st.write("**Reasoning:**", generate_reasoning(df15, fib_levels15))
             plot_chart(df15, symbol, '15m')
         
         st.subheader("30-Minute Analysis")
-        df30, score30, signal30 = process_timeframe(symbol, exchange_name, '30m')
+        df30, score30, signal30, fib_levels30 = process_timeframe(symbol, exchange_name, '30m')
         if df30 is None or df30.empty:
             st.write("No data retrieved for 30-minute timeframe. Please check your trading pair symbol and exchange selection.")
         else:
@@ -171,6 +207,7 @@ def main():
             st.write(df30.head())
             st.write(f"**30-Minute Prediction Score:** {score30}%")
             st.write(f"**30-Minute Trade Signal:** {signal30}")
+            st.write("**Reasoning:**", generate_reasoning(df30, fib_levels30))
             plot_chart(df30, symbol, '30m')
         
         st.subheader("Top 10 Buy Recommendations (15-Minute Analysis)")

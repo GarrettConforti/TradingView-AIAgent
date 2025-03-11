@@ -7,12 +7,10 @@ import matplotlib.pyplot as plt
 import pandas_ta as ta  # For technical indicators
 import ccxt  # For fetching crypto data
 
-# -------------------------------
-# Data Fetching Function
-# -------------------------------
+# Function to fetch crypto data using ccxt from a selected US-based exchange and timeframe
 def get_data(symbol, exchange_name, timeframe='15m', limit=500):
     try:
-        # Dynamically get the exchange class from ccxt (e.g., ccxt.binance or ccxt.kraken)
+        # Dynamically get the exchange class (e.g., ccxt.kraken, ccxt.coinbasepro, ccxt.gemini)
         exchange_class = getattr(ccxt, exchange_name)
         exchange = exchange_class({'enableRateLimit': True})
         # Fetch OHLCV data: each row is [timestamp, open, high, low, close, volume]
@@ -22,13 +20,11 @@ def get_data(symbol, exchange_name, timeframe='15m', limit=500):
         df.set_index('timestamp', inplace=True)
         st.write(f"Data fetched from {exchange_name} for {timeframe} timeframe for {symbol}.")
     except Exception as e:
-        st.write(f"Error fetching data for {timeframe} timeframe for {symbol}:", e)
+        st.write(f"Error fetching data for {symbol} in {timeframe} timeframe:", e)
         df = pd.DataFrame()
     return df
 
-# -------------------------------
-# Technical Indicators Functions
-# -------------------------------
+# Compute technical indicators using pandas_ta
 def compute_indicators(df):
     df['SMA14'] = ta.sma(df['close'], length=14)
     df['RSI'] = ta.rsi(df['close'], length=14)
@@ -38,6 +34,7 @@ def compute_indicators(df):
     df['BB_upper'] = bb['BBU_20_2.0']
     return df
 
+# Calculate Fibonacci retracement levels using the most recent 100 bars
 def calculate_fibonacci_levels(df, lookback=100):
     recent = df[-lookback:]
     high = recent['high'].max()
@@ -53,6 +50,7 @@ def calculate_fibonacci_levels(df, lookback=100):
     }
     return levels
 
+# Analyze volume and price action to generate a signal component
 def analyze_volume_price(df):
     df['vol_SMA'] = ta.sma(df['volume'], length=14)
     df['price_change'] = df['close'].pct_change()
@@ -62,37 +60,42 @@ def analyze_volume_price(df):
     )
     return df
 
-# -------------------------------
-# Signal & Score Calculation
-# -------------------------------
+# Aggregate technical signals into a Prediction Score (0 to 100)
 def calculate_percentage_wheel(df, fib_levels):
     latest = df.iloc[-1]
-    score = 50  # Start neutral
+    score = 50  # Neutral starting point
+    
     # RSI contribution
     if latest['RSI'] < 30:
         score += 10
     elif latest['RSI'] > 70:
         score -= 10
+
     # SMA contribution
     if latest['close'] > latest['SMA14']:
         score += 10
     else:
         score -= 10
+
     # Bollinger Bands contribution
     if latest['close'] < latest['BB_lower']:
         score += 5
     elif latest['close'] > latest['BB_upper']:
         score -= 5
-    # Fibonacci retracement contribution (using a tolerance of 1% of close)
+
+    # Fibonacci retracement contribution (with 1% tolerance)
     tolerance = 0.01 * latest['close']
     if abs(latest['close'] - fib_levels['38.2%']) < tolerance or abs(latest['close'] - fib_levels['50%']) < tolerance:
         score += 5
     if abs(latest['close'] - fib_levels['23.6%']) < tolerance:
         score -= 5
+
     # Volume/Price Action contribution
     score += latest['vol_price_signal'] * 5
+
     return max(0, min(100, score))
 
+# Convert the Prediction Score into a simple trade signal
 def predict_signal(score):
     if score > 55:
         return 'Buy'
@@ -101,9 +104,7 @@ def predict_signal(score):
     else:
         return 'Neutral'
 
-# -------------------------------
-# Chart Plotting
-# -------------------------------
+# Plot the chart with technical indicators
 def plot_chart(df, symbol, timeframe):
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(df['close'], label='Close Price')
@@ -114,11 +115,9 @@ def plot_chart(df, symbol, timeframe):
     ax.legend()
     st.pyplot(fig)
 
-# -------------------------------
-# Process Data for a Given Timeframe
-# -------------------------------
+# Process a given timeframe: fetch data, compute indicators, calculate score and signal
 def process_timeframe(symbol, exchange_name, timeframe):
-    df = get_data(symbol, exchange_name, timeframe=timeframe, limit=500)
+    df = get_data(symbol, exchange_name, timeframe, limit=500)
     if df.empty:
         return None, None, None
     df = compute_indicators(df)
@@ -128,38 +127,34 @@ def process_timeframe(symbol, exchange_name, timeframe):
     signal = predict_signal(score)
     return df, score, signal
 
-# -------------------------------
-# Analyze a List of Coins and Return Top Buy Rated
-# -------------------------------
-def analyze_coin_list(coin_list, exchange_name, timeframe='15m'):
+# Get Top 10 Coins with a Buy Rating (15-minute analysis) for US-based exchanges
+def get_top_buy_coins(exchange_name, timeframe='15m'):
+    # Predefined list of popular US-based trading pairs (exclude coins like BNB)
+    coin_list = ["BTC/USD", "ETH/USD", "ADA/USD", "SOL/USD", "XRP/USD", 
+                 "DOGE/USD", "LTC/USD", "DOT/USD", "BCH/USD", "LINK/USD"]
     results = []
     for coin in coin_list:
         df, score, signal = process_timeframe(coin, exchange_name, timeframe)
         if df is not None and not df.empty and signal == "Buy":
-            results.append({"coin": coin, "score": score})
-    results = sorted(results, key=lambda x: x["score"], reverse=True)
-    return results
+            results.append({"Coin": coin, "Score": score, "Signal": signal})
+    results = sorted(results, key=lambda x: x["Score"], reverse=True)
+    return pd.DataFrame(results[:10])
 
-# -------------------------------
-# Main Streamlit App
-# -------------------------------
+# Main Streamlit app interface
 def main():
-    st.title("Crypto Technical Analysis AI Agent")
-    st.write("""
-    Enter a crypto trading pair and select an exchange to analyze data.
-    The app will provide a Prediction Score and a Buy/Sell signal for both 15-minute and 30-minute timeframes.
-    For example, for Binance use **BTC/USDT**; for Kraken use **XBT/USD**.
-    """)
+    st.title("US-Based Crypto Technical Analysis AI Agent")
+    st.write("Enter a crypto trading pair and select a US-based exchange to analyze prediction scores for different timeframes.")
+    st.write("For example, for Kraken, Coinbase Pro, or Gemini use trading pairs like **BTC/USD**.")
     
-    # User input for single coin analysis
-    symbol = st.text_input("Trading Pair", value="BTC/USDT")
-    exchange_name = st.selectbox("Select Exchange", options=["binance", "kraken"])
+    symbol = st.text_input("Trading Pair (e.g., BTC/USD)", value="BTC/USD")
+    # Only allow US-based exchanges:
+    exchange_name = st.selectbox("Select US-Based Exchange", options=["kraken", "coinbasepro", "gemini"])
     
-    if st.button("Analyze Single Coin"):
+    if st.button("Analyze"):
         st.subheader("15-Minute Analysis")
         df15, score15, signal15 = process_timeframe(symbol, exchange_name, '15m')
         if df15 is None or df15.empty:
-            st.write("No data retrieved for 15-minute timeframe. Check your trading pair symbol and exchange selection.")
+            st.write("No data retrieved for 15-minute timeframe. Please check your trading pair symbol and exchange selection.")
         else:
             st.write("Fetched Data (15m) - First 5 rows:")
             st.write(df15.head())
@@ -170,29 +165,21 @@ def main():
         st.subheader("30-Minute Analysis")
         df30, score30, signal30 = process_timeframe(symbol, exchange_name, '30m')
         if df30 is None or df30.empty:
-            st.write("No data retrieved for 30-minute timeframe. Check your trading pair symbol and exchange selection.")
+            st.write("No data retrieved for 30-minute timeframe. Please check your trading pair symbol and exchange selection.")
         else:
             st.write("Fetched Data (30m) - First 5 rows:")
             st.write(df30.head())
             st.write(f"**30-Minute Prediction Score:** {score30}%")
             st.write(f"**30-Minute Trade Signal:** {signal30}")
             plot_chart(df30, symbol, '30m')
-    
-    st.markdown("---")
-    st.subheader("Top 10 Buy Rated Coins (15m Analysis)")
-    if st.button("Show Top 10 Buy Rated Coins"):
-        # List of popular crypto trading pairs (for Binance; adjust if needed)
-        top_coins = [
-            "BTC/USDT", "ETH/USDT", "BNB/USDT", "ADA/USDT", "XRP/USDT",
-            "SOL/USDT", "DOT/USDT", "DOGE/USDT", "AVAX/USDT", "LTC/USDT", "MATIC/USDT"
-        ]
-        buy_results = analyze_coin_list(top_coins, exchange_name, '15m')
-        if buy_results:
-            st.write("Top Buy Rated Coins (sorted by Prediction Score):")
-            for item in buy_results[:10]:
-                st.write(f"{item['coin']} - Score: {item['score']}%")
+        
+        st.subheader("Top 10 Buy Recommendations (15-Minute Analysis)")
+        top_buy_df = get_top_buy_coins(exchange_name, timeframe='15m')
+        if top_buy_df.empty:
+            st.write("No coins currently meet the Buy criteria based on the 15-minute analysis.")
         else:
-            st.write("No coins in the list currently meet the Buy criteria for 15-minute analysis.")
+            st.write("Top 10 Buy Recommendations:")
+            st.table(top_buy_df)
 
 if __name__ == "__main__":
     main()

@@ -5,34 +5,62 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import pandas_ta as ta
-import ccxt
 import requests
 
 # -------------------------------
-# 1. EXCHANGE DATA & TA FUNCTIONS
+# 1. COINGECKO TA FUNCTIONS
 # -------------------------------
 
-def get_data(symbol, exchange_name, timeframe='15m', limit=500):
+def parse_coingecko_coin_id(url: str):
     """
-    Fetches OHLCV data for a given trading pair from the specified US-based exchange.
-    Example exchanges: kraken, coinbasepro, gemini
+    Example: https://www.coingecko.com/en/coins/immutable-x
+    We'll parse out 'immutable-x' as the coin_id.
     """
-    try:
-        exchange_class = getattr(ccxt, exchange_name)
-        exchange = exchange_class({'enableRateLimit': True})
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        st.write(f"Data fetched from {exchange_name} for {timeframe} timeframe for {symbol}.")
-    except Exception as e:
-        st.write(f"Error fetching data for {symbol} in {timeframe} timeframe:", e)
-        df = pd.DataFrame()
+    parts = url.strip().split('/')
+    # We look for the segment after 'coins'
+    if 'coins' in parts:
+        idx = parts.index('coins')
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
+
+def get_coingecko_ohlc(coin_id: str, vs_currency='usd', days=7):
+    """
+    Fetch daily OHLC data from CoinGecko for the given coin_id over `days`.
+    Endpoint: /coins/{id}/ohlc?vs_currency=usd&days=7
+    Returns a list of [timestamp, open, high, low, close].
+    """
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
+    params = {
+        "vs_currency": vs_currency,
+        "days": days
+    }
+    r = requests.get(url, params=params)
+    if r.status_code == 200:
+        data = r.json()
+        if data and isinstance(data, list):
+            return data
+    return None
+
+def build_dataframe_from_ohlc(ohlc_data):
+    """
+    Convert the list of [timestamp, open, high, low, close] into a Pandas DataFrame
+    with columns: ['open', 'high', 'low', 'close'] and index = datetime in ms.
+    CoinGecko returns timestamp in milliseconds for daily data.
+    """
+    df = pd.DataFrame(ohlc_data, columns=['timestamp', 'open', 'high', 'low', 'close'])
+    # Convert timestamp (ms) to datetime
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+
+    # CoinGecko's daily OHLC doesn't include volume. We'll set volume to 0 for now.
+    df['volume'] = 0
+
     return df
 
-def compute_indicators(df):
+def compute_indicators(df: pd.DataFrame):
     """
-    Computes common technical indicators using pandas_ta.
+    Computes SMA(14), RSI(14), and Bollinger Bands (period=20, std=2).
     """
     df['SMA14'] = ta.sma(df['close'], length=14)
     df['RSI'] = ta.rsi(df['close'], length=14)
@@ -42,11 +70,21 @@ def compute_indicators(df):
     df['BB_upper'] = bb['BBU_20_2.0']
     return df
 
-def calculate_fibonacci_levels(df, lookback=100):
+def analyze_volume_price(df: pd.DataFrame):
     """
-    Calculates Fibonacci retracement levels using the most recent 'lookback' bars.
+    Creates a dummy volume/price signal. Since we have no real volume from CoinGecko daily,
+    we'll set volume=0. This means 'vol_price_signal' will always be 0.
     """
-    recent = df[-lookback:]
+    df['vol_SMA'] = ta.sma(df['volume'], length=14)
+    df['price_change'] = df['close'].pct_change()
+    df['vol_price_signal'] = 0  # Because volume=0, there's no real volume-based signal
+    return df
+
+def calculate_fibonacci_levels(df: pd.DataFrame, lookback=100):
+    """
+    Calculate Fibonacci retracement using the last `lookback` bars (daily).
+    """
+    recent = df.tail(lookback)
     high = recent['high'].max()
     low = recent['low'].min()
     diff = high - low
@@ -60,258 +98,139 @@ def calculate_fibonacci_levels(df, lookback=100):
     }
     return levels
 
-def analyze_volume_price(df):
+def calculate_percentage_wheel(df: pd.DataFrame, fib_levels: dict):
     """
-    Computes a simple volume-price action signal.
-    """
-    df['vol_SMA'] = ta.sma(df['volume'], length=14)
-    df['price_change'] = df['close'].pct_change()
-    df['vol_price_signal'] = np.where(
-        (df['volume'] > df['vol_SMA']) & (df['price_change'] > 0), 1,
-        np.where((df['volume'] > df['vol_SMA']) & (df['price_change'] < 0), -1, 0)
-    )
-    return df
-
-def calculate_percentage_wheel(df, fib_levels):
-    """
-    Aggregates various technical signals into a Prediction Score (0 to 100).
+    Aggregates signals into a Prediction Score (0 to 100).
     """
     latest = df.iloc[-1]
     score = 50  # Neutral starting point
 
-    # RSI: Oversold adds bullish bias; overbought adds bearish bias.
+    # RSI
     if latest['RSI'] < 30:
         score += 10
     elif latest['RSI'] > 70:
         score -= 10
 
-    # SMA: Price above SMA indicates bullish trend.
+    # SMA
     if latest['close'] > latest['SMA14']:
         score += 10
     else:
         score -= 10
 
-    # Bollinger Bands: Price near lower band suggests oversold conditions.
+    # Bollinger Bands
     if latest['close'] < latest['BB_lower']:
         score += 5
     elif latest['close'] > latest['BB_upper']:
         score -= 5
 
-    # Fibonacci retracement: Proximity to key levels can adjust bias.
+    # Fibonacci Retracement
     tolerance = 0.01 * latest['close']
     if abs(latest['close'] - fib_levels['38.2%']) < tolerance or abs(latest['close'] - fib_levels['50%']) < tolerance:
         score += 5
     if abs(latest['close'] - fib_levels['23.6%']) < tolerance:
         score -= 5
 
-    # Volume/Price Action: Supports the overall trend.
+    # Volume/Price Action
     score += latest['vol_price_signal'] * 5
 
     return max(0, min(100, score))
 
-def predict_signal(score):
+def predict_signal(score: float):
     """
-    Converts the Prediction Score into a simple trade signal.
+    Convert Prediction Score to Buy/Sell/Neutral.
     """
     if score > 55:
-        return 'Buy'
+        return "Buy"
     elif score < 45:
-        return 'Sell'
+        return "Sell"
     else:
-        return 'Neutral'
+        return "Neutral"
 
-def explain_signal(df, score, signal, fib_levels):
+def explain_signal(df: pd.DataFrame, score: float, signal: str, fib_levels: dict):
     """
-    Provides a brief explanation for the trade signal.
+    Provide a short textual explanation based on the indicators.
     """
     latest = df.iloc[-1]
+    rsi_val = latest['RSI']
+    sma_val = latest['SMA14']
+
     if signal == "Buy":
-        return (f"RSI at {latest['RSI']:.1f} suggests oversold conditions, price is above the 14-period SMA at {latest['SMA14']:.2f}, "
-                "and it is near key Fibonacci retracement levels. Volume and price action further support a bullish outlook.")
+        return (f"RSI at {rsi_val:.1f} suggests oversold conditions, price is above SMA(14) at {sma_val:.2f}, "
+                "and price is near key Fibonacci levels. Overall signals point to a bullish trend.")
     elif signal == "Sell":
-        return (f"RSI at {latest['RSI']:.1f} indicates overbought conditions, price is below the 14-period SMA at {latest['SMA14']:.2f}, "
-                "and it is away from key support levels. Volume and price action imply bearish momentum.")
+        return (f"RSI at {rsi_val:.1f} indicates overbought conditions, price is below SMA(14) at {sma_val:.2f}, "
+                "and price is away from support levels. Signals suggest a bearish trend.")
     else:
-        return "Indicators are mixed, resulting in a neutral outlook with no strong bias."
+        return "Indicators are mixed or neutral, no strong directional bias."
 
-def plot_chart(df, symbol, timeframe):
+def coingecko_ta_analysis(coin_id: str, vs_currency='usd', days=7):
     """
-    Plots the close price with technical indicators.
+    1) Fetch daily OHLC from CoinGecko for the last `days`.
+    2) Build DataFrame, compute indicators, compute Prediction Score.
+    3) Return (df, score, signal, explanation).
     """
-    fig, ax = plt.subplots(figsize=(12,6))
-    ax.plot(df['close'], label='Close Price')
-    ax.plot(df['SMA14'], label='SMA 14', linestyle='--')
-    ax.plot(df['BB_upper'], label='BB Upper', linestyle='--')
-    ax.plot(df['BB_lower'], label='BB Lower', linestyle='--')
-    ax.set_title(f"{symbol} - {timeframe} Chart Analysis")
-    ax.legend()
-    st.pyplot(fig)
-
-def process_timeframe(symbol, exchange_name, timeframe):
-    """
-    Processes a given timeframe by fetching data, computing indicators,
-    and calculating the Prediction Score, trade signal, and explanation.
-    """
-    df = get_data(symbol, exchange_name, timeframe, limit=500)
-    if df.empty:
+    ohlc_data = get_coingecko_ohlc(coin_id, vs_currency, days)
+    if not ohlc_data:
         return None, None, None, None
+
+    df = build_dataframe_from_ohlc(ohlc_data)
     df = compute_indicators(df)
-    fib_levels = calculate_fibonacci_levels(df, lookback=100)
     df = analyze_volume_price(df)
+    fib_levels = calculate_fibonacci_levels(df, lookback=min(days, len(df)))
     score = calculate_percentage_wheel(df, fib_levels)
     signal = predict_signal(score)
     explanation = explain_signal(df, score, signal, fib_levels)
+
     return df, score, signal, explanation
 
-# -------------------------------
-# 2. COINGECKO LOOKUP FUNCTIONS
-# -------------------------------
-
-def parse_coingecko_coin_id(url):
+def plot_daily_chart(df: pd.DataFrame, coin_id: str):
     """
-    Example: https://www.coingecko.com/en/coins/immutable-x
-    We'll parse out 'immutable-x' as the coin_id.
+    Plots daily close + TA indicators for the coin.
     """
-    parts = url.strip().split('/')
-    # We look for the segment after 'coins'
-    if 'coins' in parts:
-        idx = parts.index('coins')
-        if idx + 1 < len(parts):
-            return parts[idx + 1]
-    return None
-
-def get_coingecko_coin_data(coin_id):
-    """
-    Fetches detailed data for a coin_id from the CoinGecko API.
-    """
-    api_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}?tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false"
-    r = requests.get(api_url)
-    if r.status_code == 200:
-        return r.json()
-    return None
-
-def search_coingecko(keyword):
-    """
-    Fallback search on CoinGecko if direct coin_id fetch fails.
-    """
-    url = f"https://api.coingecko.com/api/v3/search?query={keyword}"
-    r = requests.get(url)
-    if r.status_code == 200:
-        return r.json()
-    return None
-
-def coingecko_fetch(url):
-    """
-    1) Parse the coin_id from the given CoinGecko URL
-    2) Attempt direct coin fetch
-    3) If that fails, fallback to search
-    """
-    coin_id = parse_coingecko_coin_id(url)
-    if not coin_id:
-        st.write("Could not parse coin ID from the provided CoinGecko URL.")
-        return None
-    
-    data = get_coingecko_coin_data(coin_id)
-    if data:
-        return data
-    
-    st.write("Direct CoinGecko fetch failed. Attempting fallback search by coin ID...")
-    search_results = search_coingecko(coin_id)
-    return search_results
+    fig, ax = plt.subplots(figsize=(12,6))
+    ax.plot(df['close'], label='Close Price (Daily)')
+    ax.plot(df['SMA14'], label='SMA14', linestyle='--')
+    ax.plot(df['BB_upper'], label='BB Upper', linestyle='--')
+    ax.plot(df['BB_lower'], label='BB Lower', linestyle='--')
+    ax.set_title(f"{coin_id} - Daily Chart Analysis")
+    ax.legend()
+    st.pyplot(fig)
 
 # -------------------------------
-# 3. TOP BUY COINS FUNCTION
-# -------------------------------
-
-def get_top_buy_coins_by_quote(exchange_name, quote_currency, timeframe='15m', max_pairs=30):
-    """
-    Loads all markets from the exchange, filters for pairs ending with the specified quote currency,
-    and processes each pair to find those with a 'Buy' signal.
-    Returns a DataFrame with the top 10 pairs sorted by Prediction Score.
-    """
-    try:
-        exchange_class = getattr(ccxt, exchange_name)
-        exchange = exchange_class({'enableRateLimit': True})
-        markets = exchange.load_markets()
-    except Exception as e:
-        st.write("Error loading markets:", e)
-        return pd.DataFrame()
-    
-    # Filter symbols that end with the quote currency (case-insensitive)
-    filtered_symbols = [symbol for symbol in markets if symbol.upper().endswith(f"/{quote_currency.upper()}")]
-    filtered_symbols = filtered_symbols[:max_pairs]
-    
-    results = []
-    for symbol in filtered_symbols:
-        df, score, signal, explanation = process_timeframe(symbol, exchange_name, timeframe)
-        if df is not None and signal == "Buy":
-            results.append({"Symbol": symbol, "Score": score, "Signal": signal, "Reasoning": explanation})
-    
-    results = sorted(results, key=lambda x: x["Score"], reverse=True)
-    return pd.DataFrame(results[:10])
-
-# -------------------------------
-# 4. MAIN APP INTERFACE
+# 2. STREAMLIT APP
 # -------------------------------
 
 def main():
-    st.title("Crypto Technical Analysis AI Agent (US-Based, No BNB)")
-    st.write("Analyze any trading pair on your chosen US-based exchange (Kraken, Coinbase Pro, Gemini).")
-    st.write("Compute a multi-timeframe prediction score and trade signal. Fetch coin info from CoinGecko by URL.")
-    
-    # --- Single Pair Analysis Section ---
-    st.header("Single Pair Analysis")
-    symbol = st.text_input("Trading Pair (e.g., BTC/USD, ETH/USDT)", value="BTC/USD")
-    exchange_name = st.selectbox("Select US-Based Exchange", options=["kraken", "coinbasepro", "gemini"])
-    
-    if st.button("Analyze Pair"):
-        st.subheader("15-Minute Analysis")
-        df15, score15, signal15, explanation15 = process_timeframe(symbol, exchange_name, '15m')
-        if df15 is None or df15.empty:
-            st.write("No data retrieved for 15-minute timeframe. Check your trading pair and exchange.")
+    st.title("CoinGecko TA Analysis (Daily)")
+    st.write("Fetch daily OHLC data from CoinGecko and run TA indicators (SMA, RSI, Bollinger, Fibonacci).")
+    st.write("Because CoinGecko only provides daily OHLC, this is effectively a '1-Day timeframe' analysis.")
+
+    # User inputs
+    cg_url = st.text_input("CoinGecko URL (e.g., https://www.coingecko.com/en/coins/immutable-x)", "")
+    days = st.number_input("Days of Daily Data to Fetch", min_value=1, max_value=90, value=7, step=1)
+
+    if st.button("Run TA Analysis"):
+        # 1) Parse coin_id from the URL
+        coin_id = parse_coingecko_coin_id(cg_url)
+        if not coin_id:
+            st.write("Could not parse a valid coin ID from the provided URL.")
+            return
+
+        # 2) Perform TA
+        df, score, signal, explanation = coingecko_ta_analysis(coin_id, 'usd', days)
+        if df is None or df.empty:
+            st.write("No OHLC data found for that coin/timeframe on CoinGecko.")
         else:
-            st.write("Fetched Data (15m) - First 5 rows:")
-            st.write(df15.head())
-            st.write(f"**15-Minute Prediction Score:** {score15}%")
-            st.write(f"**15-Minute Trade Signal:** {signal15}")
-            st.write(f"**Reasoning:** {explanation15}")
-            plot_chart(df15, symbol, '15m')
-        
-        st.subheader("30-Minute Analysis")
-        df30, score30, signal30, explanation30 = process_timeframe(symbol, exchange_name, '30m')
-        if df30 is None or df30.empty:
-            st.write("No data retrieved for 30-minute timeframe. Check your trading pair and exchange.")
-        else:
-            st.write("Fetched Data (30m) - First 5 rows:")
-            st.write(df30.head())
-            st.write(f"**30-Minute Prediction Score:** {score30}%")
-            st.write(f"**30-Minute Trade Signal:** {signal30}")
-            st.write(f"**Reasoning:** {explanation30}")
-            plot_chart(df30, symbol, '30m')
-    
-    # --- Top Buy Coins Search Section ---
-    st.header("Top Buy Coins Search")
-    quote_currency = st.text_input("Enter Quote Currency (e.g., USD, USDT, EUR)", value="USD")
-    if st.button("Find Top Buy Coins"):
-        st.write("Analyzing available pairs. Please wait...")
-        top_buy_df = get_top_buy_coins_by_quote(exchange_name, quote_currency, timeframe='15m')
-        if top_buy_df.empty:
-            st.write("No coins currently meet the Buy criteria for the specified quote currency and timeframe.")
-        else:
-            st.write("Top 10 Buy Recommendations (15m):")
-            st.table(top_buy_df)
-    
-    # --- CoinGecko Data Section ---
-    st.header("CoinGecko Lookup")
-    st.write("Paste a CoinGecko URL for any coin, e.g.: https://www.coingecko.com/en/coins/immutable-x")
-    cg_url = st.text_input("CoinGecko URL", "")
-    if st.button("Fetch CoinGecko Data") and cg_url:
-        data = coingecko_fetch(cg_url)
-        if data:
-            st.write("CoinGecko Result:")
-            st.json(data)
-        else:
-            st.write("No data found for that coin on CoinGecko.")
+            # Show first few rows
+            st.write("Daily OHLC Data (first 5 rows):")
+            st.write(df.head())
+
+            st.write(f"**Daily Prediction Score:** {score}%")
+            st.write(f"**Daily Trade Signal:** {signal}")
+            st.write(f"**Reasoning:** {explanation}")
+
+            # Plot daily chart
+            plot_daily_chart(df, coin_id)
 
 if __name__ == "__main__":
     main()

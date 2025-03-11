@@ -1,6 +1,6 @@
 streamlit
 pandas
-numpy
+numpy==1.25.2
 matplotlib
 pandas-ta
 yfinance

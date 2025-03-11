@@ -1,8 +1,6 @@
 streamlit
 pandas
-numpy>=1.25.2
+numpy
 matplotlib
-pandas-ta==0.3.14b0
-yfinance
-setuptools
-wheel
+pandas-ta
+ccxt

@@ -26,7 +26,7 @@ def parse_coingecko_coin_id(url: str):
 def get_market_chart_data(coin_id: str, vs_currency='usd', days=1):
     """
     Fetch market chart data from CoinGecko for the given coin_id.
-    For days <=1, it returns ~5-minute intervals.
+    If days > 1, CoinGecko may return 15m or 30m intervals instead of ~5m.
     Returns a DataFrame with columns: ['price', 'volume'] and a DateTime index.
     """
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
@@ -50,7 +50,7 @@ def get_market_chart_data(coin_id: str, vs_currency='usd', days=1):
 
 def resample_ohlcv(df: pd.DataFrame, frequency: str):
     """
-    Resample 5-minute data into OHLCV bars for the specified frequency (e.g. '15T', '30T').
+    Resample whatever interval CoinGecko provides into OHLCV bars for 'frequency' (e.g. '15T', '30T').
     Returns a DataFrame with columns: ['open', 'high', 'low', 'close', 'volume'].
     """
     if df.empty:
@@ -228,7 +228,7 @@ def plot_chart(df: pd.DataFrame, coin_id: str, timeframe: str):
 
 def analyze_coin(coin_id: str, vs_currency='usd', days=1, frequency='15T', lookback=50):
     """
-    1) Fetch ~5-minute data from CoinGecko for `days`.
+    1) Fetch data from CoinGecko (interval depends on days).
     2) Resample to the desired frequency (15m, 30m).
     3) Compute advanced indicators, weighted score, trade signal, and confidence text.
     4) Return DataFrame, score, signal, confidence, fib_levels.
@@ -256,9 +256,11 @@ def analyze_coin(coin_id: str, vs_currency='usd', days=1, frequency='15T', lookb
 def main():
     st.title("Swinger - AI Agent")
     st.write("Analyze a coin's intraday data from CoinGecko for swing trading on 15m and 30m timeframes.")
+    st.write("Note: If 'days' > 1, CoinGecko returns coarser intervals (15m, 30m, 1h, etc.), but you'll still get more historical data.")
     
     cg_url = st.text_input("CoinGecko URL (e.g., https://www.coingecko.com/en/coins/immutable-x)", "")
-    days = st.number_input("Days of Data (<=1 for best 5m intervals)", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
+    # Now allow up to 30 days (or more) to fetch bigger intervals.
+    days = st.number_input("Days of Data (1 to 30)", min_value=1, max_value=30, value=7, step=1)
     
     if st.button("Run TA Analysis"):
         coin_id = parse_coingecko_coin_id(cg_url)

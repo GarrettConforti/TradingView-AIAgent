@@ -1,68 +1,108 @@
 import numpy as np
-np.NaN = np.nan  # Monkey patch: ensures uppercase NaN exists for pandas_ta
+np.NaN = np.nan  # Ensure uppercase NaN exists for pandas_ta
 
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import pandas_ta as ta
-import ccxt
-import math
+import requests
+from datetime import datetime
 
 # -------------------------------
-# 1. DATA FETCH & INDICATORS
+# 1. COINGECKO DATA FUNCTIONS
 # -------------------------------
 
-def get_data(symbol, exchange_name, timeframe='15m', limit=200):
+def parse_coingecko_coin_id(url: str):
     """
-    Fetches OHLCV data from a specified exchange (e.g., kraken, coinbasepro, gemini)
-    for a given symbol and timeframe.
+    Parse a CoinGecko URL (e.g. https://www.coingecko.com/en/coins/immutable-x)
+    and return the coin ID (e.g. "immutable-x").
     """
-    try:
-        exchange_class = getattr(ccxt, exchange_name)
-        exchange = exchange_class({'enableRateLimit': True})
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
+    parts = url.strip().split('/')
+    if 'coins' in parts:
+        idx = parts.index('coins')
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
+
+def get_market_chart_data(coin_id: str, vs_currency='usd', days=1):
+    """
+    Fetch intraday market chart data from CoinGecko for the given coin_id.
+    For days <= 1, CoinGecko returns data in 5-minute intervals.
+    Returns a DataFrame with columns: ['price', 'volume'] and DateTime index.
+    """
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {"vs_currency": vs_currency, "days": days}
+    r = requests.get(url, params=params)
+    if r.status_code == 200:
+        data = r.json()
+        # Data fields: "prices": [[timestamp, price], ...], "total_volumes": [[timestamp, volume], ...]
+        prices = data.get("prices", [])
+        volumes = data.get("total_volumes", [])
+        if not prices or not volumes:
+            return pd.DataFrame()
+        df_prices = pd.DataFrame(prices, columns=["timestamp", "price"])
+        df_vol = pd.DataFrame(volumes, columns=["timestamp", "volume"])
+        df = pd.merge(df_prices, df_vol, on="timestamp")
+        # Convert timestamp (ms) to datetime
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True)
         return df
-    except Exception as e:
-        st.write(f"Error fetching data for {symbol} on {exchange_name} ({timeframe}):", e)
+    else:
+        st.write("Error fetching market chart data:", r.status_code)
         return pd.DataFrame()
 
-def compute_advanced_indicators(df):
+def resample_ohlcv(df: pd.DataFrame, frequency: str):
     """
-    Computes an extended set of technical indicators:
-      - RSI (14)
-      - SMA (14)
-      - Bollinger Bands (20,2)
-      - MACD (12,26,9)
-      - Stochastic (14,3,3)
-      - ADX (14)
+    Resample the 5-minute data to the desired frequency (e.g., '15T' or '30T').
+    Computes OHLC for 'price' and sum for 'volume'.
+    Returns a DataFrame with columns: ['open', 'high', 'low', 'close', 'volume'].
     """
-    # RSI, SMA, Bollinger from your original approach
-    df['RSI'] = ta.rsi(df['close'], length=14)
+    if df.empty:
+        return pd.DataFrame()
+    ohlc = df["price"].resample(frequency).ohlc()
+    vol = df["volume"].resample(frequency).sum()
+    df_resampled = ohlc.join(vol)
+    return df_resampled
+
+def get_intraday_data(coin_id: str, vs_currency='usd', days=1, frequency='15T'):
+    """
+    Fetch intraday market chart data from CoinGecko and resample to the given frequency.
+    """
+    df_5m = get_market_chart_data(coin_id, vs_currency, days)
+    if df_5m.empty:
+        return pd.DataFrame()
+    df_resampled = resample_ohlcv(df_5m, frequency)
+    return df_resampled
+
+# -------------------------------
+# 2. TECHNICAL INDICATOR FUNCTIONS
+# -------------------------------
+
+def compute_indicators(df: pd.DataFrame):
+    """
+    Computes technical indicators using pandas_ta.
+    Indicators: SMA(14), RSI(14), Bollinger Bands (20,2), MACD(12,26,9), Stochastic(14,3,3), ADX(14).
+    """
     df['SMA14'] = ta.sma(df['close'], length=14)
+    df['RSI'] = ta.rsi(df['close'], length=14)
     bb = ta.bbands(df['close'], length=20, std=2)
     df['BB_lower'] = bb['BBL_20_2.0']
     df['BB_middle'] = bb['BBM_20_2.0']
     df['BB_upper'] = bb['BBU_20_2.0']
-
-    # MACD
+    
     macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
     df['MACD'] = macd['MACD_12_26_9']
     df['MACD_signal'] = macd['MACDs_12_26_9']
     df['MACD_hist'] = macd['MACDh_12_26_9']
-
-    # Stochastic (14,3,3)
+    
     stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
     df['STOCH_K'] = stoch['STOCHk_14_3_3']
     df['STOCH_D'] = stoch['STOCHd_14_3_3']
-
-    # ADX (14)
+    
     adx = ta.adx(df['high'], df['low'], df['close'], length=14)
     df['ADX'] = adx['ADX_14']
-
-    # Volume Price Action: We'll replicate your approach
+    
+    # Volume/Price action: Use price change and volume
     df['vol_SMA'] = ta.sma(df['volume'], length=14)
     df['price_change'] = df['close'].pct_change()
     df['vol_price_signal'] = 0
@@ -71,9 +111,9 @@ def compute_advanced_indicators(df):
 
     return df
 
-def calculate_fibonacci_levels(df, lookback=100):
+def calculate_fibonacci_levels(df: pd.DataFrame, lookback=50):
     """
-    Calculate Fibonacci retracement using the last `lookback` bars.
+    Calculates Fibonacci retracement levels using the most recent 'lookback' bars.
     """
     recent = df.tail(lookback)
     high = recent['high'].max()
@@ -90,103 +130,72 @@ def calculate_fibonacci_levels(df, lookback=100):
     return levels
 
 # -------------------------------
-# 2. WEIGHTED SCORING LOGIC
+# 3. WEIGHTED SCORING FUNCTIONS
 # -------------------------------
 
-def calculate_advanced_percentage_wheel(df, fib_levels):
+def calculate_weighted_score(df: pd.DataFrame, fib_levels: dict):
     """
-    Uses multiple indicators to form a weighted score (0-100).
-    We group indicators by category, each with its own weight:
+    Computes a weighted Prediction Score based on multiple indicator groups.
+    Weights:
       - Momentum (RSI, Stochastic) ~ 25 points
       - Trend (SMA, MACD, ADX) ~ 35 points
       - Volatility (Bollinger) ~ 10 points
-      - Volume/Price action ~ 10 points
-      - Fibonacci retracement ~ 20 points
-
-    Adjust these weights or logic to suit your preference.
+      - Volume/Price Action ~ 10 points
+      - Fibonacci Retracement ~ 20 points
     """
     latest = df.iloc[-1]
     score = 0
 
-    # ========== Momentum Indicators (25 points max) ==========
-    # RSI (10 points)
+    # Momentum (25 points)
     if latest['RSI'] < 30:
-        score += 10  # strongly bullish
+        score += 10
     elif latest['RSI'] > 70:
-        # negative contribution
-        # if it's above 70, we subtract up to 10 points
         score -= 10
 
-    # Stochastic (K & D) (15 points)
-    # If STOCH_K < 20 => bullish, STOCH_K > 80 => bearish
-    # We'll do a simple approach
-    stoch_k = latest['STOCH_K']
-    if stoch_k < 20:
+    if latest['STOCH_K'] < 20:
         score += 15
-    elif stoch_k > 80:
+    elif latest['STOCH_K'] > 80:
         score -= 15
 
-    # ========== Trend Indicators (35 points max) ==========
-    # SMA14 (10 points)
+    # Trend (35 points)
     if latest['close'] > latest['SMA14']:
         score += 10
     else:
         score -= 10
 
-    # MACD (15 points)
-    # If MACD > signal => bullish, else => bearish
     if latest['MACD'] > latest['MACD_signal']:
         score += 15
     else:
         score -= 15
 
-    # ADX (10 points)
-    # If ADX > 25 => trending market => if other signals are bullish, add; if not, subtract
-    adx_val = latest['ADX']
-    if adx_val > 25:
-        # We'll add or subtract based on overall direction
-        # If MACD hist > 0 => bullish
+    if latest['ADX'] > 25:
+        # Strong trend – add/subtract 10 based on MACD histogram
         if latest['MACD_hist'] > 0:
             score += 10
         else:
             score -= 10
-    else:
-        # no strong trend
-        pass
 
-    # ========== Volatility (10 points max) ==========
-    # Bollinger Bands
+    # Volatility (10 points)
     if latest['close'] < latest['BB_lower']:
-        # oversold
         score += 10
     elif latest['close'] > latest['BB_upper']:
-        # overbought
         score -= 10
 
-    # ========== Volume/Price Action (10 points max) ==========
-    # from vol_price_signal
-    # 1 => +5, -1 => -5
-    # We'll do a simple approach
-    volume_signal = latest['vol_price_signal']
-    score += (volume_signal * 5)
+    # Volume/Price Action (10 points)
+    score += latest['vol_price_signal'] * 5
 
-    # ========== Fibonacci Retracement (20 points max) ==========
-    # If near 38.2 or 50 => +10 each for bullish
-    # If near 23.6 => -10
-    close_val = latest['close']
-    tolerance = 0.01 * close_val
-    if abs(close_val - fib_levels['38.2%']) < tolerance or abs(close_val - fib_levels['50%']) < tolerance:
+    # Fibonacci (20 points)
+    tolerance = 0.01 * latest['close']
+    if abs(latest['close'] - fib_levels['38.2%']) < tolerance or abs(latest['close'] - fib_levels['50%']) < tolerance:
         score += 10
-    if abs(close_val - fib_levels['23.6%']) < tolerance:
+    if abs(latest['close'] - fib_levels['23.6%']) < tolerance:
         score -= 10
 
-    # Bound the score between 0 and 100
-    score = max(0, min(100, score))
-    return score
+    return max(0, min(100, score))
 
-def predict_signal(score):
+def predict_trade_signal(score: float):
     """
-    Convert final weighted score into Buy/Sell/Neutral.
+    Converts the weighted score into a Buy/Sell/Neutral signal.
     """
     if score >= 70:
         return "Buy"
@@ -195,90 +204,117 @@ def predict_signal(score):
     else:
         return "Neutral"
 
-def confidence_text(score):
+def confidence_text(score: float):
     """
-    Provide a short text about swing-trade confidence based on the final score.
+    Provides a text interpretation of swing-trade confidence based on the score.
     """
     if score >= 80:
         return "High confidence in a bullish swing trade."
     elif score >= 60:
         return "Moderate confidence in a bullish swing trade."
     elif score >= 40:
-        return "Neutral to slight bearish; swing trade is risky."
+        return "Mixed signals; caution advised."
     else:
-        return "Likely bearish conditions; low confidence in a buy swing trade."
+        return "Low confidence; market appears bearish."
 
 # -------------------------------
-# 3. PLOTTING & MAIN LOGIC
+# 4. ANALYSIS PIPELINE
 # -------------------------------
 
-def analyze_timeframe(symbol, exchange_name, timeframe='15m', lookback=100):
+def analyze_coin(coin_id: str, vs_currency='usd', days=1, frequency='15T', lookback=50):
     """
-    Fetch data, compute advanced indicators, fib levels, weighted score, and produce final signals.
+    Fetches intraday data from CoinGecko, resamples it, computes indicators,
+    calculates a weighted Prediction Score, and returns the DataFrame and metrics.
     """
-    df = get_data(symbol, exchange_name, timeframe, limit=200)
-    if df.empty or len(df) < 30:
+    df_raw = get_market_chart_data(coin_id, vs_currency, days)
+    if df_raw.empty:
         return None, None, None, None, None
+    df_resampled = resample_ohlcv(df_raw, frequency)
+    if df_resampled.empty or len(df_resampled) < 30:
+        return None, None, None, None, None
+    df_resampled = compute_indicators(df_resampled)
+    fib_levels = calculate_fibonacci_levels(df_resampled, lookback)
+    score = calculate_weighted_score(df_resampled, fib_levels)
+    signal = predict_trade_signal(score)
+    conf = confidence_text(score)
+    return df_resampled, score, signal, conf, fib_levels
 
-    df = compute_advanced_indicators(df)
-    fib_levels = calculate_fibonacci_levels(df, lookback)
-    score = calculate_advanced_percentage_wheel(df, fib_levels)
-    signal = predict_signal(score)
-    conf_text = confidence_text(score)
-    return df, score, signal, conf_text, fib_levels
+# (Reusing earlier functions to fetch and resample 5m data)
+def get_market_chart_data(coin_id: str, vs_currency='usd', days=1):
+    """
+    Fetch market chart data from CoinGecko for the given coin_id.
+    Returns a DataFrame with 5-minute interval data if days <=1.
+    """
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {"vs_currency": vs_currency, "days": days}
+    r = requests.get(url, params=params)
+    if r.status_code == 200:
+        data = r.json()
+        prices = data.get("prices", [])
+        volumes = data.get("total_volumes", [])
+        if not prices or not volumes:
+            return pd.DataFrame()
+        df_prices = pd.DataFrame(prices, columns=["timestamp", "price"])
+        df_volumes = pd.DataFrame(volumes, columns=["timestamp", "volume"])
+        df = pd.merge(df_prices, df_volumes, on="timestamp")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True)
+        return df
+    else:
+        st.write("Error fetching CoinGecko data:", r.status_code)
+        return pd.DataFrame()
 
-def plot_chart(df, symbol, timeframe):
+def resample_ohlcv(df: pd.DataFrame, frequency: str):
     """
-    Plot close price with some key indicators for a quick visual.
+    Resample 5-minute data into OHLCV bars of the specified frequency.
     """
-    fig, ax = plt.subplots(figsize=(12,6))
-    ax.plot(df['close'], label='Close Price')
-    ax.plot(df['SMA14'], label='SMA14', linestyle='--')
-    ax.plot(df['BB_upper'], label='BB Upper', linestyle='--')
-    ax.plot(df['BB_lower'], label='BB Lower', linestyle='--')
-    ax.set_title(f"{symbol} - {timeframe} Analysis")
-    ax.legend()
-    st.pyplot(fig)
+    if df.empty:
+        return pd.DataFrame()
+    ohlc = df["price"].resample(frequency).ohlc()
+    vol = df["volume"].resample(frequency).sum()
+    df_resampled = ohlc.join(vol)
+    return df_resampled
 
 # -------------------------------
-# 4. STREAMLIT APP
+# 5. STREAMLIT APP INTERFACE
 # -------------------------------
 
 def main():
-    st.title("Advanced Swing-Trade Analysis (15m & 30m) with Weighted Indicators")
-    st.write("We incorporate RSI, SMA, Bollinger, MACD, Stochastic, ADX, Volume/Price, and Fibonacci for a more detailed score.")
-
-    # Input fields
-    symbol = st.text_input("Trading Pair (e.g., BTC/USD)", value="BTC/USD")
-    exchange_name = st.selectbox("Select Exchange", ["kraken", "coinbasepro", "gemini"])
-    lookback = st.number_input("Fibonacci Lookback (bars)", min_value=20, max_value=200, value=100)
-
-    if st.button("Analyze Swing Trade"):
-        # 15m
-        st.subheader("15-Minute Analysis")
-        df15, score15, signal15, conf15, fib15 = analyze_timeframe(symbol, exchange_name, '15m', lookback)
-        if df15 is None:
-            st.write("Not enough data for 15m timeframe.")
+    st.title("Swinger - AI Agent")
+    st.write("Analyze a coin's intraday data from CoinGecko for swing trading on 15m and 30m timeframes.")
+    
+    cg_url = st.text_input("CoinGecko URL (e.g., https://www.coingecko.com/en/coins/immutable-x)", "")
+    days = st.number_input("Days of Data (should be <=1 for intraday, 1 for best resolution)", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
+    
+    if st.button("Run TA Analysis"):
+        coin_id = parse_coingecko_coin_id(cg_url)
+        if not coin_id:
+            st.write("Invalid CoinGecko URL. Please enter a URL like https://www.coingecko.com/en/coins/immutable-x")
+            return
+        
+        st.subheader("15-Minute Chart Analysis")
+        df15, score15, signal15, conf15, fib15 = analyze_coin(coin_id, 'usd', days, '15T', lookback=50)
+        if df15 is None or df15.empty:
+            st.write("Not enough 15m data. Try increasing days or check the coin.")
         else:
-            st.write(f"**15m Score:** {score15} / 100")
+            st.write(f"**15m Prediction Score:** {score15}/100")
             st.write(f"**15m Signal:** {signal15}")
-            st.write(f"**Swing-Trade Confidence:** {conf15}")
-            st.write("First 5 rows of data:")
+            st.write(f"**Swing Trade Confidence:** {conf15}")
+            st.write("Sample 15m Data (first 5 rows):")
             st.write(df15.head())
-            plot_chart(df15, symbol, '15m')
-
-        # 30m
-        st.subheader("30-Minute Analysis")
-        df30, score30, signal30, conf30, fib30 = analyze_timeframe(symbol, exchange_name, '30m', lookback)
-        if df30 is None:
-            st.write("Not enough data for 30m timeframe.")
+            plot_chart(df15, coin_id, '15m')
+        
+        st.subheader("30-Minute Chart Analysis")
+        df30, score30, signal30, conf30, fib30 = analyze_coin(coin_id, 'usd', days, '30T', lookback=50)
+        if df30 is None or df30.empty:
+            st.write("Not enough 30m data. Try increasing days or check the coin.")
         else:
-            st.write(f"**30m Score:** {score30} / 100")
+            st.write(f"**30m Prediction Score:** {score30}/100")
             st.write(f"**30m Signal:** {signal30}")
-            st.write(f"**Swing-Trade Confidence:** {conf30}")
-            st.write("First 5 rows of data:")
+            st.write(f"**Swing Trade Confidence:** {conf30}")
+            st.write("Sample 30m Data (first 5 rows):")
             st.write(df30.head())
-            plot_chart(df30, symbol, '30m')
+            plot_chart(df30, coin_id, '30m')
 
 if __name__ == "__main__":
     main()

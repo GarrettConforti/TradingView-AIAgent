@@ -3,4 +3,4 @@ pandas
 numpy
 matplotlib
 pandas-ta
-requests
+ccxt

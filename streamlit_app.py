@@ -1,158 +1,42 @@
 import numpy as np
-np.NaN = np.nan  # Ensure uppercase NaN exists for pandas_ta
+np.NaN = np.nan  # Monkey patch: ensures uppercase NaN exists for pandas_ta
 
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-import pandas_ta as ta
-import requests
+import pandas_ta as ta  # For technical indicators
+import ccxt  # For fetching crypto data
 
-######################################
-# 1. URL PARSING & DATA FETCH
-######################################
+# Function to fetch crypto data using ccxt from the selected exchange and timeframe
+def get_data(symbol, exchange_name, timeframe='15m', limit=500):
+    try:
+        # Dynamically get the exchange class (e.g., ccxt.binance or ccxt.kraken)
+        exchange_class = getattr(ccxt, exchange_name)
+        exchange = exchange_class({'enableRateLimit': True})
+        # Fetch OHLCV data: [timestamp, open, high, low, close, volume]
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        st.write(f"Data fetched from {exchange_name} for {timeframe} timeframe for {symbol}.")
+    except Exception as e:
+        st.write(f"Error fetching data for {symbol} in {timeframe} timeframe:", e)
+        df = pd.DataFrame()
+    return df
 
-def parse_user_url(url: str):
-    """
-    Determine whether the user URL is a CoinGecko link or a DexScreener link.
-    Return a tuple (source, identifier) where:
-      source = 'coingecko' or 'dexscreener'
-      identifier = coin_id (if coingecko) OR (chain, contract) if dex
-    """
-    url = url.strip().lower()
-    if "coingecko.com" in url and "/coins/" in url:
-        # parse coin_id
-        parts = url.split('/')
-        if 'coins' in parts:
-            idx = parts.index('coins')
-            if idx + 1 < len(parts):
-                coin_id = parts[idx + 1]
-                return ('coingecko', coin_id)
-        return ('coingecko', None)
-    elif "dexscreener.com" in url:
-        # parse chain + contract
-        # format: https://dexscreener.com/solana/9fmdkqip...
-        parts = url.split('/')
-        if len(parts) >= 5:
-            chain = parts[3]
-            contract = parts[4]
-            return ('dexscreener', (chain, contract))
-        return ('dexscreener', None)
-    else:
-        return (None, None)
-
-def fetch_coingecko_data(coin_id: str, vs_currency='usd', days=7):
-    """
-    Fetch intraday data from CoinGecko's /market_chart endpoint.
-    Returns a DataFrame with columns ['price', 'volume'] and a DateTime index.
-    """
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {"vs_currency": vs_currency, "days": days}
-    r = requests.get(url, params=params)
-    if r.status_code == 200:
-        data = r.json()
-        prices = data.get("prices", [])
-        volumes = data.get("total_volumes", [])
-        if not prices or not volumes:
-            return pd.DataFrame()
-        dfp = pd.DataFrame(prices, columns=["timestamp", "price"])
-        dfv = pd.DataFrame(volumes, columns=["timestamp", "volume"])
-        df = pd.merge(dfp, dfv, on="timestamp")
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df.set_index("timestamp", inplace=True)
-        return df
-    else:
-        st.write("CoinGecko API Error:", r.status_code)
-        return pd.DataFrame()
-
-def fetch_dexscreener_data(chain: str, contract: str):
-    """
-    Attempt to fetch candle data from DexScreener's pool API:
-      https://api.dexscreener.com/latest/dex/trading-pairs/{chain}/{contract}
-    We expect a 'chart' key with candle arrays: [timestamp_s, open, high, low, close, volume].
-    """
-    url = f"https://api.dexscreener.com/latest/dex/trading-pairs/{chain}/{contract}"
-    r = requests.get(url)
-    if r.status_code == 200:
-        data = r.json()
-        if "chart" in data and isinstance(data["chart"], list) and data["chart"]:
-            candles = data["chart"]  # each item: [ts_s, open, high, low, close, volume]
-            df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            # DexScreener timestamps are in seconds
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-            df.set_index("timestamp", inplace=True)
-            return df
-        else:
-            st.write("DexScreener: no 'chart' data found.")
-            return pd.DataFrame()
-    else:
-        st.write("DexScreener API Error:", r.status_code)
-        return pd.DataFrame()
-
-def resample_ohlcv(df: pd.DataFrame, frequency: str):
-    """
-    Resample DataFrame with columns: open, high, low, close, volume to the desired frequency (e.g. '15T').
-    If the DF was from CoinGecko, we only have 'price' & 'volume', so we do a different approach.
-    """
-    if df.empty:
-        return pd.DataFrame()
-
-    required_cols = set(["open", "high", "low", "close", "volume"])
-    if required_cols.issubset(df.columns):
-        # We already have OHLCV
-        ohlc = df[["open", "high", "low", "close"]].resample(frequency).agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last"
-        })
-        vol = df["volume"].resample(frequency).sum()
-        df_resampled = pd.concat([ohlc, vol], axis=1)
-        return df_resampled
-    else:
-        # This must be CoinGecko data with columns ["price", "volume"]
-        ohlc = df["price"].resample(frequency).ohlc()
-        vol = df["volume"].resample(frequency).sum()
-        df_resampled = ohlc.join(vol)
-        return df_resampled
-
-#############################################
-# 2. ADVANCED INDICATORS & WEIGHTED SCORING
-#############################################
-
-def compute_indicators(df: pd.DataFrame):
-    """
-    Compute advanced indicators (SMA, RSI, Bollinger, MACD, Stoch, ADX, Volume/Price).
-    """
+# Compute technical indicators using pandas_ta
+def compute_indicators(df):
     df['SMA14'] = ta.sma(df['close'], length=14)
     df['RSI'] = ta.rsi(df['close'], length=14)
-
     bb = ta.bbands(df['close'], length=20, std=2)
     df['BB_lower'] = bb['BBL_20_2.0']
     df['BB_middle'] = bb['BBM_20_2.0']
     df['BB_upper'] = bb['BBU_20_2.0']
-
-    macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-    df['MACD'] = macd['MACD_12_26_9']
-    df['MACD_signal'] = macd['MACDs_12_26_9']
-    df['MACD_hist'] = macd['MACDh_12_26_9']
-
-    stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
-    df['STOCH_K'] = stoch['STOCHk_14_3_3']
-    df['STOCH_D'] = stoch['STOCHd_14_3_3']
-
-    adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-    df['ADX'] = adx['ADX_14']
-
-    df['vol_SMA'] = ta.sma(df['volume'], length=14)
-    df['price_change'] = df['close'].pct_change()
-    df['vol_price_signal'] = 0
-    df.loc[(df['volume'] > df['vol_SMA']) & (df['price_change'] > 0), 'vol_price_signal'] = 1
-    df.loc[(df['volume'] > df['vol_SMA']) & (df['price_change'] < 0), 'vol_price_signal'] = -1
-
     return df
 
-def calculate_fibonacci_levels(df: pd.DataFrame, lookback=50):
-    recent = df.tail(lookback)
+# Calculate Fibonacci retracement levels using the most recent 100 bars
+def calculate_fibonacci_levels(df, lookback=100):
+    recent = df[-lookback:]
     high = recent['high'].max()
     low = recent['low'].min()
     diff = high - low
@@ -166,174 +50,141 @@ def calculate_fibonacci_levels(df: pd.DataFrame, lookback=50):
     }
     return levels
 
-def calculate_weighted_score(df: pd.DataFrame, fib_levels: dict):
-    latest = df.iloc[-1]
-    score = 0
+# Analyze volume and price action to generate a signal component
+def analyze_volume_price(df):
+    df['vol_SMA'] = ta.sma(df['volume'], length=14)
+    df['price_change'] = df['close'].pct_change()
+    df['vol_price_signal'] = np.where(
+        (df['volume'] > df['vol_SMA']) & (df['price_change'] > 0), 1,
+        np.where((df['volume'] > df['vol_SMA']) & (df['price_change'] < 0), -1, 0)
+    )
+    return df
 
-    # Momentum: RSI
+# Aggregate technical signals into a Prediction Score (0 to 100)
+def calculate_percentage_wheel(df, fib_levels):
+    latest = df.iloc[-1]
+    score = 50  # Neutral starting point
+    
+    # RSI contribution
     if latest['RSI'] < 30:
         score += 10
     elif latest['RSI'] > 70:
         score -= 10
-    # Stochastic
-    if latest['STOCH_K'] < 20:
-        score += 15
-    elif latest['STOCH_K'] > 80:
-        score -= 15
 
-    # Trend: SMA14
+    # SMA contribution
     if latest['close'] > latest['SMA14']:
         score += 10
     else:
         score -= 10
-    # MACD
-    if latest['MACD'] > latest['MACD_signal']:
-        score += 15
-    else:
-        score -= 15
-    # ADX
-    if latest['ADX'] > 25:
-        if latest['MACD_hist'] > 0:
-            score += 10
-        else:
-            score -= 10
 
-    # Volatility: Bollinger
+    # Bollinger Bands contribution
     if latest['close'] < latest['BB_lower']:
-        score += 10
+        score += 5
     elif latest['close'] > latest['BB_upper']:
-        score -= 10
+        score -= 5
 
-    # Volume/Price
+    # Fibonacci retracement contribution (using a tolerance of 1% of close)
+    tolerance = 0.01 * latest['close']
+    if abs(latest['close'] - fib_levels['38.2%']) < tolerance or abs(latest['close'] - fib_levels['50%']) < tolerance:
+        score += 5
+    if abs(latest['close'] - fib_levels['23.6%']) < tolerance:
+        score -= 5
+
+    # Volume/Price Action contribution
     score += latest['vol_price_signal'] * 5
-
-    # Fibonacci
-    close_val = latest['close']
-    tolerance = 0.01 * close_val
-    if abs(close_val - fib_levels['38.2%']) < tolerance or abs(close_val - fib_levels['50%']) < tolerance:
-        score += 10
-    if abs(close_val - fib_levels['23.6%']) < tolerance:
-        score -= 10
 
     return max(0, min(100, score))
 
-def predict_trade_signal(score: float):
-    if score >= 70:
-        return "Buy"
-    elif score <= 30:
-        return "Sell"
+# Convert the prediction score into a simple trade signal
+def predict_signal(score):
+    if score > 55:
+        return 'Buy'
+    elif score < 45:
+        return 'Sell'
     else:
-        return "Neutral"
+        return 'Neutral'
 
-def confidence_text(score: float):
-    if score >= 80:
-        return "High confidence in a bullish swing trade."
-    elif score >= 60:
-        return "Moderate confidence in a bullish swing trade."
-    elif score >= 40:
-        return "Mixed signals; caution advised."
-    else:
-        return "Low confidence; market appears bearish."
-
-######################################
-# 3. UNIFIED ANALYSIS FUNCTION
-######################################
-
-def analyze_url(url: str, days=7, frequency='15T', lookback=50):
-    """
-    Parse the user URL. If it's a CoinGecko link, fetch from CoinGecko.
-    If it's a DexScreener link, fetch from DexScreener.
-    Then resample to 'frequency', compute indicators, and produce a weighted score.
-    """
-    source, identifier = parse_user_url(url)
-    if source == 'coingecko':
-        # identifier = coin_id
-        if not identifier:
-            return None, None, None, None, None
-        df_raw = fetch_coingecko_data(identifier, 'usd', days)
-        if df_raw.empty:
-            return None, None, None, None, None
-        df_resampled = resample_ohlcv(df_raw, frequency)
-    elif source == 'dexscreener':
-        # identifier = (chain, contract)
-        if not identifier or not isinstance(identifier, tuple):
-            return None, None, None, None, None
-        chain, contract = identifier
-        df_raw = fetch_dexscreener_data(chain, contract)
-        if df_raw.empty:
-            return None, None, None, None, None
-        # DexScreener might already have open/high/low/close/volume
-        df_resampled = resample_ohlcv(df_raw, frequency)
-    else:
-        # unrecognized URL
-        return None, None, None, None, None
-
-    if df_resampled.empty or len(df_resampled) < 10:
-        return None, None, None, None, None
-
-    # rename columns if needed to standardize
-    # we expect columns: open, high, low, close, volume
-    for col in ["open", "high", "low", "close", "volume"]:
-        if col not in df_resampled.columns:
-            return None, None, None, None, None
-
-    # compute advanced indicators
-    df_resampled = compute_indicators(df_resampled)
-    fib_levels = calculate_fibonacci_levels(df_resampled, lookback)
-    score = calculate_weighted_score(df_resampled, fib_levels)
-    signal = predict_trade_signal(score)
-    conf = confidence_text(score)
-    return df_resampled, score, signal, conf, fib_levels
-
-def plot_chart(df: pd.DataFrame, title_str: str):
-    fig, ax = plt.subplots(figsize=(12,6))
+# Plot the chart with technical indicators
+def plot_chart(df, symbol, timeframe):
+    fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(df['close'], label='Close Price')
-    ax.plot(df['SMA14'], label='SMA14', linestyle='--')
+    ax.plot(df['SMA14'], label='SMA 14', linestyle='--')
     ax.plot(df['BB_upper'], label='BB Upper', linestyle='--')
     ax.plot(df['BB_lower'], label='BB Lower', linestyle='--')
-    ax.set_title(title_str)
+    ax.set_title(f"{symbol} - {timeframe} Chart Analysis")
     ax.legend()
     st.pyplot(fig)
 
-######################################
-# 4. STREAMLIT APP
-######################################
+# Process a given timeframe: fetch data, compute indicators, calculate score and signal
+def process_timeframe(symbol, exchange_name, timeframe):
+    df = get_data(symbol, exchange_name, timeframe, limit=500)
+    if df.empty:
+        return None, None, None
+    df = compute_indicators(df)
+    fib_levels = calculate_fibonacci_levels(df, lookback=100)
+    df = analyze_volume_price(df)
+    score = calculate_percentage_wheel(df, fib_levels)
+    signal = predict_signal(score)
+    return df, score, signal
 
+# New function: Get Top 10 Coins with a Buy Rating based on 15-minute analysis
+def get_top_buy_coins(exchange_name, timeframe='15m'):
+    # Predefined list of popular coins (adjust according to exchange)
+    if exchange_name == "binance":
+        coin_list = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "ADA/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "LTC/USDT", "DOT/USDT", "AVAX/USDT"]
+    elif exchange_name == "kraken":
+        coin_list = ["XBT/USD", "ETH/USD", "ADA/USD", "SOL/USD", "XRP/USD", "DOGE/USD", "LTC/USD", "DOT/USD", "BCH/USD", "LINK/USD"]
+    else:
+        coin_list = []
+    
+    results = []
+    for coin in coin_list:
+        df, score, signal = process_timeframe(coin, exchange_name, timeframe)
+        if df is not None and not df.empty:
+            if signal == "Buy":
+                results.append({"Coin": coin, "Score": score, "Signal": signal})
+    results = sorted(results, key=lambda x: x["Score"], reverse=True)
+    return pd.DataFrame(results[:10])
+
+# Main Streamlit app interface
 def main():
-    st.title("Swinger - AI Agent")
-    st.write("Enter either a CoinGecko URL (e.g. https://www.coingecko.com/en/coins/immutable-x) or a DexScreener URL (e.g. https://dexscreener.com/solana/<contract>).")
-    st.write("We'll parse and fetch the data, then do 15m & 30m TA with advanced indicators and a weighted score.")
+    st.title("Crypto Technical Analysis AI Agent")
+    st.write("Enter a crypto trading pair and select an exchange to analyze prediction scores for different timeframes.")
+    st.write("For example, for Binance use **BTC/USDT**; for Kraken use **XBT/USD**.")
     
-    user_url = st.text_input("CoinGecko or DexScreener URL", "")
-    days = st.number_input("Days of Data (CoinGecko only)", min_value=1, max_value=30, value=7, step=1,
-                           help="For DexScreener, 'days' is ignored. For CoinGecko, days up to 30.")
+    symbol = st.text_input("Trading Pair", value="BTC/USDT")
+    exchange_name = st.selectbox("Select Exchange", options=["binance", "kraken"])
     
-    if st.button("Run TA Analysis"):
-        # 15-Minute
-        st.subheader("15-Minute Chart Analysis")
-        df15, score15, signal15, conf15, fib15 = analyze_url(user_url, days, '15T', 50)
+    if st.button("Analyze"):
+        st.subheader("15-Minute Analysis")
+        df15, score15, signal15 = process_timeframe(symbol, exchange_name, '15m')
         if df15 is None or df15.empty:
-            st.write("No 15m data. Possibly the URL is invalid or data not available.")
+            st.write("No data retrieved for 15-minute timeframe. Please check your trading pair symbol and exchange selection.")
         else:
-            st.write(f"**15m Score:** {score15}/100")
-            st.write(f"**15m Signal:** {signal15}")
-            st.write(f"**Confidence:** {conf15}")
-            st.write("Sample 15m data (first 5 rows):")
+            st.write("Fetched Data (15m) - First 5 rows:")
             st.write(df15.head())
-            plot_chart(df15, "15m Chart Analysis")
+            st.write(f"**15-Minute Prediction Score:** {score15}%")
+            st.write(f"**15-Minute Trade Signal:** {signal15}")
+            plot_chart(df15, symbol, '15m')
         
-        # 30-Minute
-        st.subheader("30-Minute Chart Analysis")
-        df30, score30, signal30, conf30, fib30 = analyze_url(user_url, days, '30T', 50)
+        st.subheader("30-Minute Analysis")
+        df30, score30, signal30 = process_timeframe(symbol, exchange_name, '30m')
         if df30 is None or df30.empty:
-            st.write("No 30m data. Possibly the URL is invalid or data not available.")
+            st.write("No data retrieved for 30-minute timeframe. Please check your trading pair symbol and exchange selection.")
         else:
-            st.write(f"**30m Score:** {score30}/100")
-            st.write(f"**30m Signal:** {signal30}")
-            st.write(f"**Confidence:** {conf30}")
-            st.write("Sample 30m data (first 5 rows):")
+            st.write("Fetched Data (30m) - First 5 rows:")
             st.write(df30.head())
-            plot_chart(df30, "30m Chart Analysis")
+            st.write(f"**30-Minute Prediction Score:** {score30}%")
+            st.write(f"**30-Minute Trade Signal:** {signal30}")
+            plot_chart(df30, symbol, '30m')
+        
+        st.subheader("Top 10 Buy Recommendations (15-Minute Analysis)")
+        top_buy_df = get_top_buy_coins(exchange_name, timeframe='15m')
+        if top_buy_df.empty:
+            st.write("No coins currently meet the Buy criteria based on the 15-minute analysis.")
+        else:
+            st.write("Top 10 Buy Recommendations:")
+            st.table(top_buy_df)
 
 if __name__ == "__main__":
     main()

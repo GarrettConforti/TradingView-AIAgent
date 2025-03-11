@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import pandas_ta as ta  # For technical indicators
-import ccxt  # For fetching crypto data from exchanges
+import ccxt  # For fetching crypto data from US-based exchanges
 import requests  # For fetching data from Dexscreener
 
 # -------------------------------
@@ -14,13 +14,12 @@ import requests  # For fetching data from Dexscreener
 
 def get_data(symbol, exchange_name, timeframe='15m', limit=500):
     """
-    Fetches OHLCV data for a given trading pair from the specified exchange.
+    Fetches OHLCV data for a given trading pair from the specified US-based exchange.
+    Example exchanges: kraken, coinbasepro, gemini
     """
     try:
-        # Get the exchange class dynamically (e.g., ccxt.kraken, ccxt.coinbasepro, ccxt.gemini)
         exchange_class = getattr(ccxt, exchange_name)
         exchange = exchange_class({'enableRateLimit': True})
-        # Fetch OHLCV data: [timestamp, open, high, low, close, volume]
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -165,15 +164,15 @@ def process_timeframe(symbol, exchange_name, timeframe):
     return df, score, signal, explanation
 
 # -------------------------------
-# DEXSCREENER DATA FUNCTION
+# DEXSCREENER FUNCTIONS
 # -------------------------------
 
-def get_dexscreener_data(url):
+def get_dexscreener_data_exact(url):
     """
-    Converts a Dexscreener URL to its API endpoint and fetches the JSON data.
+    Converts a Dexscreener URL (chain + pool) into the Dexscreener API endpoint
+    and fetches the JSON data for that specific pool.
     Example:
-      Input:  https://dexscreener.com/solana/x131b3frgn4b8ue51eyvrnzwutubgom93uryrnteefy
-      API:    https://api.dexscreener.com/latest/dex/trading-pairs/solana/x131b3frgn4b8ue51eyvrnzwutubgom93uryrnteefy
+      https://dexscreener.com/solana/xPoolId -> https://api.dexscreener.com/latest/dex/trading-pairs/solana/xPoolId
     """
     try:
         parts = url.split('/')
@@ -192,6 +191,28 @@ def get_dexscreener_data(url):
             return None
     except Exception as e:
         st.write("Exception in fetching Dexscreener data:", e)
+        return None
+
+def search_dexscreener(keyword):
+    """
+    A broader Dexscreener search approach (undocumented endpoint).
+    Attempts to return as many results as possible for the given keyword.
+    Dexscreener may still limit or filter results.
+    """
+    try:
+        # Some Dexscreener endpoints are not officially documented;
+        # 'search' might accept a 'limit' param, but we try to keep it large or omit it.
+        # Example guess: https://api.dexscreener.com/search?q={keyword}&limit=9999
+        # If it doesn't work, Dexscreener might have changed their API or restrict large queries.
+        search_url = f"https://api.dexscreener.com/search?q={keyword}&limit=9999"
+        response = requests.get(search_url)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.write("Error searching Dexscreener:", response.status_code)
+            return None
+    except Exception as e:
+        st.write("Exception in searching Dexscreener:", e)
         return None
 
 # -------------------------------
@@ -230,14 +251,13 @@ def get_top_buy_coins_by_quote(exchange_name, quote_currency, timeframe='15m', m
 # -------------------------------
 
 def main():
-    st.title("Crypto Technical Analysis AI Agent")
-    st.write("Analyze any trading pair on your chosen exchange to get a Prediction Score, a trade signal, and brief reasoning based on technical analysis.")
-    st.write("You can also search for top coins by specifying a quote currency or fetch data directly from Dexscreener.")
+    st.title("Crypto Technical Analysis AI Agent (US-Based, No BNB)")
+    st.write("Analyze any trading pair on your chosen US-based exchange. Get a Prediction Score, trade signal, and short TA reasoning. Also search Dexscreener for broader data.")
     
     # --- Single Pair Analysis Section ---
     st.header("Single Pair Analysis")
     symbol = st.text_input("Trading Pair (e.g., BTC/USD, ETH/USDT)", value="BTC/USD")
-    exchange_name = st.selectbox("Select Exchange", options=["kraken", "coinbasepro", "gemini"])
+    exchange_name = st.selectbox("Select US-Based Exchange", options=["kraken", "coinbasepro", "gemini"])
     
     if st.button("Analyze Pair"):
         st.subheader("15-Minute Analysis")
@@ -277,15 +297,25 @@ def main():
             st.table(top_buy_df)
     
     # --- Dexscreener Data Section ---
-    st.header("Dexscreener Data Fetch")
-    dex_url = st.text_input("Enter Dexscreener URL (e.g., https://dexscreener.com/solana/x131b3frgn4b8ue51eyvrnzwutubgom93uryrnteefy)", "")
-    if st.button("Fetch Dexscreener Data") and dex_url:
-        dex_data = get_dexscreener_data(dex_url)
+    st.header("Dexscreener Exact Pool Lookup")
+    dex_url = st.text_input("Enter Dexscreener Pool URL (e.g., https://dexscreener.com/solana/xPoolId)")
+    if st.button("Fetch Dexscreener Data (Exact)") and dex_url:
+        dex_data = get_dexscreener_data_exact(dex_url)
         if dex_data:
-            st.write("Dexscreener Data:")
+            st.write("Exact Dexscreener Data:")
             st.json(dex_data)
         else:
-            st.write("Failed to fetch data from Dexscreener.")
+            st.write("Failed to fetch data from Dexscreener (Exact).")
+    
+    st.header("Dexscreener Broad Search")
+    dex_keyword = st.text_input("Enter a keyword to search Dexscreener (no strict limit)", "")
+    if st.button("Search Dexscreener (Broad)") and dex_keyword:
+        results = search_dexscreener(dex_keyword)
+        if results:
+            st.write("Dexscreener Search Results:")
+            st.json(results)
+        else:
+            st.write("No results or error from Dexscreener search.")
 
 if __name__ == "__main__":
     main()
